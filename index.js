@@ -421,9 +421,16 @@ http
         if (!out.streams.length) {
           const st = magis.seedStatus();
           if (out._deadline || (!st.pool && st.lastError)) {
-            proxyPool.markBad();
-            await waitRoute();
-            out = await doStream();
+            /* Primero rotación barata: si la sesión murió, otra cuenta del
+               stockpile privado se adopta al instante — sin proxy ni
+               descubrimiento. Solo si no hay stockpile se re-descubre ruta. */
+            if (!st.pool && st.lastError) proxyPool.markSessionDead();
+            if (proxyPool.nextPrivateSession()) out = await doStream();
+            if (!out.streams.length) {
+              proxyPool.markBad();
+              await waitRoute();
+              out = await doStream();
+            }
           }
         }
       }

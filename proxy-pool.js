@@ -78,18 +78,23 @@ function fetchCandidates(cb) {
             const j = JSON.parse(d);
             (j.data || []).forEach((p) => {
               const key = p.ip + ':' + p.port;
+              const proto =
+                (p.protocols || []).includes('socks5') ? 'socks5' : 'http';
               if (!seen[key]) {
                 seen[key] = 1;
-                out.push(key);
+                out.push(proto + '://' + key);
               }
             });
           } catch (e) {}
         } else {
           d.split(/\r?\n/).forEach((l) => {
-            const m = /^(?:https?|socks[45])?:?\/*([\d.]+:\d+)/.exec(l.trim());
-            if (m && !seen[m[1]]) {
-              seen[m[1]] = 1;
-              out.push(m[1]);
+            /* Conserva el esquema: los candidatos socks5 van por el túnel
+               SOCKS5 de upstream (más ancho de pool gratis). socks4 no
+               soportado → se descarta. */
+            const m = /^(?:(https?|socks[45]))?:?\/*([\d.]+:\d+)/.exec(l.trim());
+            if (m && m[1] !== 'socks4' && !seen[m[2]]) {
+              seen[m[2]] = 1;
+              out.push((m[1] || 'http').toLowerCase() + '://' + m[2]);
             }
           });
         }
@@ -103,17 +108,39 @@ function fetchCandidates(cb) {
    throw dentro del forEach mata el descubrimiento entero: los waiters de
    ensureRoute quedan colgados para siempre. Blindamos cada candidato. */
 
+/* Normaliza candidatos: los viejos cacheados venían como 'ip:port' pelado. */
+const asUrl = (p) => (p.indexOf('://') >= 0 ? p : 'http://' + p);
 function testConnect(proxy, cb) {
-  const [h, po] = proxy.split(':');
-  const port = parseInt(po, 10);
+  const m = /^(?:(\w+):\/\/)?([\d.]+):(\d+)$/.exec(asUrl(proxy));
+  if (!m) return cb(false);
+  const proto = m[1] || 'http';
+  const h = m[2];
+  const port = parseInt(m[3], 10);
   if (!h || !port) return cb(false);
   let done = false;
   let s;
   try {
     s = net.connect(port, h, () => {
-      s.write(
-        'CONNECT ' + PROBE_HOST + ':443 HTTP/1.1\r\nHost: ' + PROBE_HOST + ':443\r\n\r\n'
-      );
+      if (proto.startsWith('socks')) {
+        /* Greeting SOCKS5 no-auth + CONNECT a PROBE_HOST:443 (ATYP=3). */
+        const hb = Buffer.from(PROBE_HOST, 'utf8');
+        s.once('data', (g) => {
+          if (g.length < 2 || g[0] !== 5 || g[1] !== 0) return fin(false);
+          const req = Buffer.concat([
+            Buffer.from([5, 1, 0, 3, hb.length]),
+            hb,
+            Buffer.from([0, 443 >> 8, 443 & 0xff]),
+          ]);
+          req.writeUInt16BE(443, req.length - 2);
+          s.once('data', (r) => fin(r.length > 1 && r[0] === 5 && r[1] === 0));
+          s.write(req);
+        });
+        s.write(Buffer.from([5, 1, 0]));
+      } else {
+        s.write(
+          'CONNECT ' + PROBE_HOST + ':443 HTTP/1.1\r\nHost: ' + PROBE_HOST + ':443\r\n\r\n'
+        );
+      }
     });
   } catch (e) {
     return cb(false);
@@ -165,7 +192,7 @@ function probeMac() {
   return mac;
 }
 function probePortal(proxy, cb) {
-  const agent = upstream.agentForUrl(true, '', 443, 'http://' + proxy);
+  const agent = upstream.agentForUrl(true, '', 443, asUrl(proxy));
   if (!agent) return cb(false);
   /* Una sola salida: si el timeout gana y la respuesta llega después (o
      viceversa), un segundo cb() dispara done() dos veces →
@@ -229,9 +256,64 @@ function probePortal(proxy, cb) {
   );
 }
 
+/* Granja de sesiones privadas: cada probe que pasa v8/active mintea una
+   cuenta real — en vez de tirar la de los perdedores, se cosechan todas.
+   Las sesiones funcionan DIRECTO desde cualquier IP, así que un stockpile
+   permite rotar sesiones muertas sin volver a pagar el descubrimiento de
+   proxies. Se persiste en disco y dura semanas por cuenta. */
+const SEEDS_FILE = path.join(__dirname, 'vendor', '.xuper-private-seeds.json');
+const PRIVATE_SEED_MAX = 30;
+let privateSeeds = null;
+function loadPrivateSeeds() {
+  if (privateSeeds) return privateSeeds;
+  try {
+    const f = JSON.parse(fs.readFileSync(SEEDS_FILE, 'utf8'));
+    privateSeeds = Array.isArray(f) ? f.filter((s) => s && s.userToken) : [];
+  } catch (e) {
+    privateSeeds = [];
+  }
+  return privateSeeds;
+}
+function savePrivateSeeds() {
+  try {
+    fs.writeFileSync(SEEDS_FILE, JSON.stringify(privateSeeds));
+  } catch (e) {}
+}
+function harvestMint(mint) {
+  if (!mint || !mint.userToken) return;
+  const pool = loadPrivateSeeds();
+  if (pool.some((s) => s.userToken === mint.userToken)) return;
+  pool.push({ ...mint, at: Date.now(), dead: false });
+  while (pool.length > PRIVATE_SEED_MAX) pool.shift();
+  savePrivateSeeds();
+}
+/* Rotación sin proxy: adopta la próxima sesión privada viva del stockpile.
+   Devuelve true si quedó una sesión adoptada. */
+function nextPrivateSession() {
+  const pool = loadPrivateSeeds();
+  const s = pool.find((x) => !x.dead && x.userToken && x.userToken !== magis.session.userToken);
+  if (!s) return false;
+  adoptMint(s);
+  console.log('[xuper-proxy] sesión privada adoptada del stockpile (' + pool.filter((x) => !x.dead).length + ' restantes)');
+  return true;
+}
+/* Una sesión adoptada resultó muerta (el portal la rechazó): se marca para
+   no volver a elegirla. */
+function markSessionDead() {
+  const pool = loadPrivateSeeds();
+  const s = pool.find((x) => x.userToken === magis.session.userToken);
+  if (s) {
+    s.dead = true;
+    savePrivateSeeds();
+  }
+}
+
 /* Adopta una cuenta recién minteada como sesión viva del proceso: evita
    depender de las semillas públicas y resuelve el aaa100083 de sesiones
-   compartidas. session es el objeto exportado por magis (misma referencia). */
+   compartidas. session es el objeto exportado por magis (misma referencia).
+   Además persiste en el mismo archivo /tmp que usa magis, así que un
+   restart no vuelve a pagar el minteo. */
+const SESSION_FILE = '/tmp/xuper-session.json';
 function adoptMint(mint) {
   if (!mint || !mint.userToken) return;
   magis.session.sn = mint.sn || magis.session.sn;
@@ -243,6 +325,19 @@ function adoptMint(mint) {
   magis.session.seed = null;
   magis.session.at = Date.now();
   magis.session.lastError = '';
+  harvestMint(mint);
+  try {
+    fs.writeFileSync(
+      SESSION_FILE,
+      JSON.stringify({
+        sn: magis.session.sn,
+        userId: magis.session.userId,
+        userToken: magis.session.userToken,
+        snToken: magis.session.snToken,
+        at: magis.session.at,
+      })
+    );
+  } catch (e) {}
 }
 
 function activate(proxy, cb) {
@@ -296,6 +391,10 @@ function tryCandidates(list, cb) {
   if (!pending) return cb(new Error('sin proxies vivos'));
   cands.forEach((p) =>
     probePortal(p, (ok, mint) => {
+      /* Cosecha SIEMPRE la sesión minteada (aunque otro proxy ya haya
+         ganado la ruta): queda en el stockpile para rotaciones futuras
+         sin pagar descubrimiento. */
+      if (ok && mint) harvestMint(mint);
       if (settled) return;
       if (ok) {
         settled = true;
@@ -344,7 +443,7 @@ function ensureRoute(cb) {
     let cached = null;
     try {
       const f = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-      if (f && f.proxy && Date.now() - f.at < 12 * 3600e3) cached = f.proxy;
+      if (f && f.proxy && Date.now() - f.at < 12 * 3600e3) cached = asUrl(f.proxy);
     } catch (e) {}
     if (!cached) return next();
     probePortal(cached, (ok, mint) => {
@@ -413,6 +512,8 @@ function markBad() {
 module.exports = {
   ensureRoute,
   markBad,
+  nextPrivateSession,
+  markSessionDead,
   current: () => current,
   /* Hook de auto-restauración: se dispara cuando la revalidación encuentra
      la ruta muerta. index.js lo usa para re-descubrir en background, así
