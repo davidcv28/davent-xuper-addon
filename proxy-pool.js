@@ -40,7 +40,10 @@ let inflight = null;
 let revalTimer = null;
 let onRouteLost = null;
 let lastOkAt = 0;
-const ROUTE_OK_MS = 120e3;
+/* Ventana de confianza ciega tras activar/sondear la ruta. Los proxies
+   públicos duran segundos-minutos: 120s dejaba requests pudriéndose en una
+   ruta ya muerta. 30s + el probe barato por request cuando vence. */
+const ROUTE_OK_MS = 30e3;
 
 function fetchText(u, timeoutMs, cb) {
   const mod = u.startsWith('https:') ? https : http;
@@ -132,11 +135,34 @@ function testConnect(proxy, cb) {
   s.on('data', (d) => fin(/HTTP\/1\.[01] 200/.test(d.toString())));
 }
 
-/* La prueba de verdad: una llamada pre-auth del portal (geo-gated).
-   snToken no pisa la sesión viva — es seguro sondear aunque ya haya una.
-   El agente va atado al proxy del probe (no al config global) y corre fuera
-   de la cola serial: así varios probes corren en paralelo y el descubrimiento
-   en frío tarda segundos en vez de minutos. */
+/* La prueba de verdad: la MISMA cadena que hace ensureSession —
+   v3/snToken + v8/active — porque el geo-fence (portal100024) vive en
+   v8/active, no en snToken. Sondear solo pre-auth elegía proxies que
+   pasaban el handshake pero no podían crear sesión.
+   Bonus: v8/active exitosa mintea una cuenta REAL — el ganador adopta
+   esas credenciales como sesión propia (ver adoptMint), independiente
+   del pool de semillas públicas (que están quemadas para todo internet).
+   El agente va atado al proxy del probe (no al config global) y corre
+   fuera de la cola serial. */
+const DEVICE_FILE = path.join(__dirname, 'vendor', '.xuper-device.json');
+const ACT_RESERVE1 = '583442714b345572434a4d5769637461545a735936413d3d';
+const SNTOKEN_SALT = 'ntFT65w6itH!lHCPw7D=@qnsFC5adD28';
+const crypto = require('crypto');
+function probeMac() {
+  try {
+    const f = JSON.parse(fs.readFileSync(DEVICE_FILE, 'utf8'));
+    const m = String((f && f.macAddr) || '').trim().toLowerCase();
+    if (/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(m)) return m;
+  } catch (e) {}
+  const mac =
+    '02:' +
+    Math.random().toString(16).slice(2, 12).padEnd(10, '0').slice(0, 10)
+      .replace(/(..)(?=.)/g, '$1:');
+  try {
+    fs.writeFileSync(DEVICE_FILE, JSON.stringify({ macAddr: mac }));
+  } catch (e) {}
+  return mac;
+}
 function probePortal(proxy, cb) {
   const agent = upstream.agentForUrl(true, '', 443, 'http://' + proxy);
   if (!agent) return cb(false);
@@ -145,22 +171,77 @@ function probePortal(proxy, cb) {
      inflight.slice() sobre null → crash que deja a TODOS los waiters
      colgados. */
   let fired = false;
-  const fin = (ok) => {
+  const fin = (ok, mint) => {
     if (fired) return;
     fired = true;
     clearTimeout(t);
-    cb(ok);
+    cb(ok, mint);
   };
   const t = setTimeout(() => fin(false), ACT_TIMEOUT_MS);
-  magis.call(
-    'v3/snToken',
-    {
-      androidId: 'probe' + Math.random().toString(16).slice(2, 12),
-      cpuId: 'probe' + Math.random().toString(16).slice(2, 12),
-    },
-    { baseFields: false, urgent: true, probe: true, agent: agent },
-    (e, r) => fin(!e && !!(r && r.snToken))
+  const opts = { baseFields: false, urgent: true, probe: true, agent: agent };
+  /* Mismo fingerprint que manda ensureSession: un device parcial podría
+     ser rechazado por el portal aunque el proxy sea bueno. */
+  const fp = Object.assign({}, magis.FINGERPRINT_FIXED || {}, {
+    androidId: crypto.randomBytes(8).toString('hex'),
+    cpuId: crypto.randomBytes(8).toString('hex'),
+    serialNumber: crypto.randomBytes(8).toString('hex'),
+    etheMac: crypto.randomBytes(6).toString('hex').replace(/(..)(?=.)/g, '$1:'),
+    gatewayMac: crypto.randomBytes(6).toString('hex').replace(/(..)(?=.)/g, '$1:'),
+    wifiMac: crypto.randomBytes(6).toString('hex').replace(/(..)(?=.)/g, '$1:'),
+  });
+  magis.call('v3/snToken', fp, opts,
+    (e, r) => {
+      const snToken = String((r && r.snToken) || '').trim();
+      if (e || !snToken) return fin(false);
+      /* Misma derivación que ensureSession: si el portal no manda sn,
+         se deriva del snToken con el salt del vendor. */
+      const sn =
+        String((r && r.sn) || '').trim() ||
+        crypto.createHash('md5').update(snToken + SNTOKEN_SALT).digest('hex');
+      magis.call(
+        'v8/active',
+        {
+          snToken: snToken,
+          authVersion: '',
+          authCode: '',
+          macAddr: probeMac(),
+          reserve1: ACT_RESERVE1,
+          openNum: 3,
+          channel: 'default',
+          matadata: '',
+          signdata: '',
+          sn: sn, // explícito: pisa el session.sn global de deviceDict
+        },
+        opts,
+        (e2, r2) => {
+          const userToken = String((r2 && r2.userToken) || '').trim();
+          if (e2 || !userToken) return fin(false);
+          fin(true, {
+            userId: String((r2 && r2.userId) || '').trim(),
+            userToken: userToken,
+            snToken: snToken,
+            sn: sn,
+          });
+        }
+      );
+    }
   );
+}
+
+/* Adopta una cuenta recién minteada como sesión viva del proceso: evita
+   depender de las semillas públicas y resuelve el aaa100083 de sesiones
+   compartidas. session es el objeto exportado por magis (misma referencia). */
+function adoptMint(mint) {
+  if (!mint || !mint.userToken) return;
+  magis.session.sn = mint.sn || magis.session.sn;
+  magis.session.snToken = mint.snToken || magis.session.snToken;
+  magis.session.userId = mint.userId;
+  magis.session.userToken = mint.userToken;
+  magis.session.ready = true;
+  magis.session.usesSeed = false;
+  magis.session.seed = null;
+  magis.session.at = Date.now();
+  magis.session.lastError = '';
 }
 
 function activate(proxy, cb) {
@@ -182,12 +263,13 @@ function scheduleRevalidate() {
   if (revalTimer) clearTimeout(revalTimer);
   revalTimer = setTimeout(() => {
     if (!current) return;
-    probePortal(current, (ok) => {
+    probePortal(current, (ok, mint) => {
       if (!ok) {
         console.log('[xuper-proxy] ruta caída en revalidación: ' + current);
         current = null;
         onRouteLost && onRouteLost();
       } else {
+        adoptMint(mint); // la revalidación mintea sesión fresca de paso
         scheduleRevalidate();
       }
     });
@@ -206,10 +288,11 @@ function tryCandidates(list, cb) {
     settled = false;
   if (!pending) return cb(new Error('sin proxies vivos'));
   cands.forEach((p) =>
-    probePortal(p, (ok) => {
+    probePortal(p, (ok, mint) => {
       if (settled) return;
       if (ok) {
         settled = true;
+        adoptMint(mint);
         return activate(p, cb);
       }
       if (--pending === 0) {
@@ -257,16 +340,20 @@ function ensureRoute(cb) {
       if (f && f.proxy && Date.now() - f.at < 12 * 3600e3) cached = f.proxy;
     } catch (e) {}
     if (!cached) return next();
-    probePortal(cached, (ok) => {
-      if (ok) return activate(cached, done);
+    probePortal(cached, (ok, mint) => {
+      if (ok) {
+        adoptMint(mint);
+        return activate(cached, done);
+      }
       next();
     });
   };
 
   if (current && Date.now() - lastOkAt < ROUTE_OK_MS) return done(null, current);
   if (current) {
-    return probePortal(current, (ok) => {
+    return probePortal(current, (ok, mint) => {
       if (ok) {
+        adoptMint(mint);
         lastOkAt = Date.now();
         return done(null, current);
       }

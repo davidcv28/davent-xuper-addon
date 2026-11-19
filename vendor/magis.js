@@ -2490,6 +2490,7 @@ module.exports = {
   post: post,
   ensureSession: ensureSession,
   session: session,
+  FINGERPRINT_FIXED: FINGERPRINT_FIXED,
   seedStatus: function () {
     var e,
       r = 0;
