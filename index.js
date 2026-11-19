@@ -12,6 +12,13 @@
  * Uso: node index.js   (PORT=7801 por defecto)
  */
 'use strict';
+// Sin estos handlers, una promesa rechazada en el bootstrap de magis
+// (sesión del portal, DoH, seeds) mata el proceso — en un host el servicio
+// entra en crash-loop y el health check nunca pasa. El server HTTP debe
+// sobrevivir aunque el portal no responda. Van ANTES del require.
+process.on('unhandledRejection', (e) => console.log('[xuper] unhandledRejection:', e && e.message));
+process.on('uncaughtException', (e) => console.log('[xuper] uncaughtException:', e && e.message));
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -263,6 +270,7 @@ http
       res.end(b);
     };
     try {
+      console.log('[xuper] req', req.method, req.url);
       const u = new URL(req.url, 'http://x');
       // ADDON_TOKEN (opcional, para la instancia pública hosteada): si está
       // seteado, todas las rutas exigen el prefijo /{token} — como hace
