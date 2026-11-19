@@ -40,6 +40,12 @@ var crypto = require("crypto"),
   SEED_BACKUP_URL =
     "https://raw.githubusercontent.com/xuper-plugin/kino-plugin-xuper/seeds/seeds.json",
   SEED_FILE = path.join(__dirname, ".xuper-seeds.json"),
+  /* Identidad de dispositivo propia por instalación: FIXED_MAC genérico de
+     emulador lo comparten TODAS las copias de este código (y cualquier
+     emulador del mundo) — si el portal amarra la sesión a macAddr, cada
+     activación ajena patea la nuestra (aaa100083 "logged in on another
+     device"). MAC random persistida = dispositivo único. */
+  DEVICE_ID_FILE = path.join(__dirname, ".xuper-device.json"),
   SEED_DEAD_FILE = path.join(__dirname, ".xuper-seeds-dead.json"),
   SEED_MAX = 200,
   SEED_MIN_LIFE_MS = 3e5,
@@ -131,6 +137,23 @@ function decryptBlob(e) {
 }
 function randomHex(e) {
   return crypto.randomBytes(e).toString("hex");
+}
+var INSTALLED_MAC = null;
+function deviceMac() {
+  if (INSTALLED_MAC) return INSTALLED_MAC;
+  try {
+    var f = JSON.parse(fs.readFileSync(DEVICE_ID_FILE, "utf8")),
+      m = trim(f && f.macAddr);
+    if (/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(m))
+      return (INSTALLED_MAC = m.toLowerCase());
+  } catch (e) {}
+  /* Prefijo 02: = locally administered, el mismo espacio que usa el MAC
+     genérico de Android — formato indistinguible del real. */
+  var mac = "02:" + randomHex(5).replace(/(..)(?=.)/g, "$1:");
+  try {
+    fs.writeFileSync(DEVICE_ID_FILE, JSON.stringify({ macAddr: mac }));
+  } catch (e) {}
+  return (INSTALLED_MAC = mac);
 }
 function text(e) {
   return null == e ? "" : String(e);
@@ -1013,7 +1036,7 @@ function ensureSession(e) {
               snToken: t,
               authVersion: "",
               authCode: "",
-              macAddr: FIXED_MAC,
+              macAddr: deviceMac(),
               reserve1: FIXED_RESERVE1,
               openNum: 3,
               channel: "default",
@@ -1391,7 +1414,7 @@ function detail(e, r, t) {
           type: callType,
           sortType: "0",
           language: "en",
-          macAddr: FIXED_MAC,
+          macAddr: deviceMac(),
         },
         function (err, s) {
           if (err && !isRetry) {

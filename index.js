@@ -42,6 +42,23 @@ function readEnvFile(file) {
 }
 const ENV = { ...readEnvFile(ROOT_ENV), ...process.env };
 const TMDB_KEY = ENV.TMDB_API_KEY || '';
+// Proxy saliente para TODO el tráfico del portal (CONNECT tunnel, soporta
+// auth en la URL). El portal bloquea por región/IP (portal100024): con
+// XUPER_PROXY=http://host:port o http://user:pass@host:port el addon sale
+// por la IP del proxy. Aplica a magis (sesiones, catálogo, streams); las
+// URLs de stream resultantes las fetchea directo el player, así que el
+// proxy solo importa para el handshake con el portal.
+// Sin XUPER_PROXY, proxyPool descubre y rota proxies HTTP LatAm públicos:
+// la sesión del portal no está atada a la IP, así que solo hace falta
+// mantener UNA ruta viva.
+const proxyPool = require('./proxy-pool');
+if (ENV.XUPER_PROXY || ENV.HTTPS_PROXY || ENV.https_proxy) {
+  const upstream = require('./vendor/upstream');
+  upstream.configure(ENV.XUPER_PROXY || ENV.HTTPS_PROXY || ENV.https_proxy);
+  console.log('[xuper] proxy saliente:', JSON.stringify(upstream.describe()));
+} else {
+  proxyPool.ensureRoute(() => {});
+}
 // Deadline duro por pedido /stream: con el portal caído, magis intenta el
 // rescate de semillas una por una (un roundtrip c/u) y el pedido cuelga
 // minutos. Mejor cortar y devolver [] — el server ya tiene su propio timeout.
@@ -328,10 +345,32 @@ http
       // Deadline por request: si el portal está caído, magis quema semillas
       // una por una sin cortar (cada rescate = un roundtrip) y el pedido
       // cuelga minutos. Mejor responder [] rápido y que el caller falle solo.
-      const out = await Promise.race([
-        handleStream(m[1], decodeURIComponent(m[2])),
-        new Promise((r) => setTimeout(() => r({ streams: [], _deadline: true }), STREAM_DEADLINE_MS)),
-      ]);
+      // Sin ruta viva el deadline se fuma en reintentos de DNS/timeout;
+      // ensureRoute primero (corta si ya hay proxy sano).
+      const doStream = () =>
+        Promise.race([
+          handleStream(m[1], decodeURIComponent(m[2])),
+          new Promise((r) =>
+            setTimeout(() => r({ streams: [], _deadline: true }), STREAM_DEADLINE_MS)
+          ),
+        ]);
+      let out;
+      if (ENV.XUPER_PROXY || ENV.HTTPS_PROXY || ENV.https_proxy) {
+        out = await doStream();
+      } else {
+        await proxyPool.ensureRoute(() => {});
+        out = await doStream();
+        // 0 streams + sesión geo-bloqueada/muerta en masa o deadline con el
+        // proxy colgado → la ruta probablemente murió; re-sondear y un retry.
+        if (!out.streams.length && !out._deadline) {
+          const st = magis.seedStatus();
+          if (!st.pool && st.lastError) {
+            proxyPool.markBad();
+            await proxyPool.ensureRoute(() => {});
+            out = await doStream();
+          }
+        }
+      }
       console.log(`[xuper] ${m[1]} ${m[2]} → ${out.streams.length} streams (${Date.now() - t0}ms)`);
       send(200, { streams: out.streams || [] });
     } catch (e) {
