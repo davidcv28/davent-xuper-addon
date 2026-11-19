@@ -1,11 +1,12 @@
 'use strict';
 /* Pool de proxies HTTP LatAm con auto-descubrimiento.
-   El portal Magis bloquea por región/IP (portal100024): Argentina, datacenters
-   y exits Tor conocidos. Los proxies públicos LatAm sí entran, pero viven
-   poco — hay que sondear, elegir uno vivo y re-sondear cuando muera.
-   La sesión del portal NO está atada a la IP (las semillas lo demuestran),
-   así que cambiar de proxy en caliente no mata la sesión: solo hay que
-   mantener UNA ruta viva configurada en upstream. */
+   El portal Magis bloquea por región/IP (portal100024) SOLO en v8/active:
+   Argentina, datacenters y exits Tor conocidos no pueden ACTIVAR un
+   dispositivo, pero una sesión ya minteada funciona desde cualquier IP.
+   Por eso la probe hace snToken+v8/active por cada proxy candidato: la
+   ruta elegida sirve para mintear/renovar la sesión (adoptMint), y todo
+   el tráfico restante (search, detail, resolve) va DIRECTO — el proxy
+   público, que vive minutos, deja de ser el camino de las requests. */
 const net = require('net');
 const https = require('https');
 const http = require('http');
@@ -247,7 +248,13 @@ function adoptMint(mint) {
 function activate(proxy, cb) {
   current = proxy;
   lastOkAt = Date.now();
-  upstream.configure('http://' + proxy);
+  /* El geo-fence del portal solo está en v8/active: la probe ya minteó la
+     sesión por el proxy (per-proxy agent) y el resto del tráfico (search,
+     detail, resolve) pasa DIRECTO — comprobado: la sesión no está atada a
+     IP y las llamadas autenticadas no revisan región. Dejar el proxy global
+     puesto solo lo convertiría en cuello de botella: los públicos mueren
+     en minutos y arrastran los resolves. */
+  upstream.configure(null);
   try {
     fs.writeFileSync(
       CACHE_FILE,
