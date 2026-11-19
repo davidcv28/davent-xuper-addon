@@ -202,7 +202,11 @@ async function findPortalItem(want, type) {
     let res;
     try {
       res = await cb(magis.search, q);
-    } catch { continue; }
+      console.log(`[xuper] search "${q}" → ${((res && res.items) || []).length} ítems`);
+    } catch (e) {
+      console.log(`[xuper] search "${q}" falló:`, e && e.message);
+      continue;
+    }
     const items = (res && res.items) || [];
     let best = null,
       bestScore = 0;
@@ -298,9 +302,15 @@ async function handleStream(type, rawId) {
   if (!m) return { streams: [] };
   const [, id, sNum, eNum] = m;
   const want = await titleFor(type, id);
-  if (!want) return { streams: [] };
+  if (!want) {
+    console.log('[xuper] sin metadatos para', type, id);
+    return { streams: [] };
+  }
   const item = await findPortalItem(want, type);
-  if (!item) return { streams: [] };
+  if (!item) {
+    console.log('[xuper] sin match en portal:', want.title, `(${want.year})`, 'como', type);
+    return { streams: [] };
+  }
   const opts = { quality: 'auto', hevc: true, uhd: true };
 
   if (type === 'movie') {
@@ -316,7 +326,10 @@ async function handleStream(type, rawId) {
   }
 
   // series: cada temporada es un ítem; episodes[] lleva id propio + number
-  const det = await cb(magis.detail, item.id).catch(() => null);
+  const det = await cb(magis.detail, item.id).catch((e) => {
+    console.log('[xuper] detail falló:', e && e.message);
+    return null;
+  });
   if (!det) return { streams: [] };
   const season = Number(sNum || 1);
   const episode = Number(eNum || 1);
@@ -332,7 +345,10 @@ async function handleStream(type, rawId) {
     }
   }
   const ep = eps.find((x) => Number(x.number) === episode);
-  if (!ep) return { streams: [] };
+  if (!ep) {
+    console.log(`[xuper] episodio ${episode} no está en la temporada ${season} (eps: ${eps.map((x) => x.number).join(',') || 'ninguno'})`);
+    return { streams: [] };
+  }
   try {
     const streams = await resolveTracks(ep.id, seasonItemId, opts);
     const ranger = await rangerStream(ep.id, seasonItemId);
@@ -398,11 +414,13 @@ http
       } else {
         await waitRoute();
         out = await doStream();
-        // 0 streams + sesión geo-bloqueada/muerta en masa o deadline con el
-        // proxy colgado → la ruta probablemente murió; re-sondear y un retry.
-        if (!out.streams.length && !out._deadline) {
+        // 0 streams por deadline (ruta colgada — la firma típica de proxy
+        // muerto) o con pool de semillas agotado → ruta sospechosa: se marca
+        // mala, se re-descubre y se reintenta UNA vez. Un miss legítimo
+        // (título que no está en el catálogo) responde rápido y no reintenta.
+        if (!out.streams.length) {
           const st = magis.seedStatus();
-          if (!st.pool && st.lastError) {
+          if (out._deadline || (!st.pool && st.lastError)) {
             proxyPool.markBad();
             await waitRoute();
             out = await doStream();

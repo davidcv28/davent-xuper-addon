@@ -140,7 +140,18 @@ function testConnect(proxy, cb) {
 function probePortal(proxy, cb) {
   const agent = upstream.agentForUrl(true, '', 443, 'http://' + proxy);
   if (!agent) return cb(false);
-  const t = setTimeout(() => cb(false), ACT_TIMEOUT_MS);
+  /* Una sola salida: si el timeout gana y la respuesta llega después (o
+     viceversa), un segundo cb() dispara done() dos veces →
+     inflight.slice() sobre null → crash que deja a TODOS los waiters
+     colgados. */
+  let fired = false;
+  const fin = (ok) => {
+    if (fired) return;
+    fired = true;
+    clearTimeout(t);
+    cb(ok);
+  };
+  const t = setTimeout(() => fin(false), ACT_TIMEOUT_MS);
   magis.call(
     'v3/snToken',
     {
@@ -148,10 +159,7 @@ function probePortal(proxy, cb) {
       cpuId: 'probe' + Math.random().toString(16).slice(2, 12),
     },
     { baseFields: false, urgent: true, probe: true, agent: agent },
-    (e, r) => {
-      clearTimeout(t);
-      cb(!e && !!(r && r.snToken));
-    }
+    (e, r) => fin(!e && !!(r && r.snToken))
   );
 }
 
@@ -229,8 +237,11 @@ function ensureRoute(cb) {
     return;
   }
   inflight = [cb];
+  let doneFired = false;
   const done = (err, p) => {
-    const waiters = inflight.slice();
+    if (doneFired) return; // defensa: callbacks tardíos no re-disparan
+    doneFired = true;
+    const waiters = inflight ? inflight.slice() : [];
     inflight = null;
     waiters.forEach((w) => {
       try {
