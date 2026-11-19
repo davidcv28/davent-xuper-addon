@@ -7,7 +7,7 @@ var crypto = require("crypto"),
   path = require("path"),
   dnsx = require("./dnsx"),
   upstream = require("./upstream"),
-  KEY_HEX = "e7af1ed7de1ffddd7bd3fe37ebdffde9ef3fe1ae39edfeb8",
+  KEY_HEX = "db5ddfdb869cff5e1beffe1cd37fdadb4f7fdfcdde69dd5b",
   HOSTS = [
     "mptec.dhkrxuzcy.com",
     "ftmrmy.jdfey0cd.com",
@@ -20,15 +20,16 @@ var crypto = require("crypto"),
   ],
   PORTAL_CODE = "masnew",
   APP_ID = "com.android.msandroid",
-  APK_VERSION = "49902",
-  SPKG_VER = "2024-09-10 06:25:30_33_13_",
-  APK_VER_HEADER = "43404",
+  APK_VERSION = "49920",
+  SPKG_VER = "2024-05-08 12:40:09_30_11_",
+  APK_VER_HEADER = "49920",
   USER_AGENT = "okhttp/3.12.12",
   CONTENT_TYPE = "application/json;charset=utf-8",
   SNTOKEN_SALT = "ntFT65w6itH!lHCPw7D=@qnsFC5adD28",
   FIXED_MAC = "02:00:00:00:00:00",
   FIXED_RESERVE1 = "583442714b345572434a4d5769637461545a735936413d3d",
-  FIXED_DRM_ID = "0iSGEyv2EqiS/nqI/I3hqdu12irw5Q3/uqrWvRFx9bM=",
+  FIXED_DRM_ID = "a1yHRdimGZNoRV5STI7PRAk/L4ec3bLOh9/wNULfVmo=",
+  FIXED_B29 = "583442714b345572434a4e6667476f72685373496b3874536576774470327448",
   UA_CDN = "Ranger/4.9.4-17294ac0",
   RATE_MS = 450,
   TREE_TTL = 6e5,
@@ -36,6 +37,8 @@ var crypto = require("crypto"),
   SLB_TTL = 3e5,
   SEED_URL =
     "https://raw.githubusercontent.com/cristianco7/XUPER-HYDRA-PORT-WEBOS/seeds/seeds.json",
+  SEED_BACKUP_URL =
+    "https://raw.githubusercontent.com/xuper-plugin/kino-plugin-xuper/seeds/seeds.json",
   SEED_FILE = path.join(__dirname, ".xuper-seeds.json"),
   SEED_DEAD_FILE = path.join(__dirname, ".xuper-seeds-dead.json"),
   SEED_MAX = 200,
@@ -56,6 +59,7 @@ var crypto = require("crypto"),
     aaa100080: 1,
     aaa100082: 1,
     aaa100083: 1,
+    portal200001: 1,
   },
   SESSION_MAX_AGE_MS = 216e5,
   ROOT_CODES = {
@@ -76,33 +80,33 @@ var crypto = require("crypto"),
   },
   DEVICE_FIXED = {
     loginType: "2",
-    appLanguage: "en",
-    hardwareInfo: "ranchu",
-    model: "sdk_gphone64_arm64",
-    product: "sdk_gphone64_arm64",
-    cpu: "arm64-v8a",
-    B29: "",
+    appLanguage: "es",
+    hardwareInfo: "rtd288o",
+    model: "Smart TV Pro",
+    product: "G03_4K_GB",
+    cpu: "armeabi-v7a",
+    B29: FIXED_B29,
     reserve1: FIXED_RESERVE1,
     deviceToken: "",
     drmId: FIXED_DRM_ID,
-    sdkVer: 33,
+    sdkVer: 30,
   },
   FINGERPRINT_FIXED = {
-    board: "goldfish_arm64",
-    brand: "google",
-    cpuAbi: "arm64-v8a",
-    device: "emu64a",
-    diskInfo: "8GB",
-    display: "sdk_gphone64_arm64",
+    board: "RTD2851M",
+    brand: "TCL",
+    cpuAbi: "armeabi-v7a",
+    device: "BeyondTV4",
+    diskInfo: "",
+    display: "RP1A.200622.001 release-keys",
     fingerprint:
-      "google/sdk_gphone64_arm64/emu64a:14/UE1A.230829.036/11228894:user/release-keys",
-    hardware: "ranchu",
-    host: "abfarm",
-    manufacturer: "Google",
-    ramSize: "4GB",
-    romSize: "8GB",
+      "TCL/G03_4K_GB/BeyondTV4:11/RP1A.200622.001/AR09:user/release-keys",
+    hardware: "rtd288o",
+    host: "cbbb68b8f80d",
+    manufacturer: "TCL",
+    ramSize: "2.15 GB",
+    romSize: "10.91 GB",
     tags: "release-keys",
-    verId: "",
+    verId: "RP1A.200622.001",
   };
 function bufFrom(e, r) {
   return Buffer.from ? Buffer.from(e, r) : new Buffer(e, r);
@@ -326,14 +330,25 @@ function post(e, r, t) {
            DNS del operador (en Argentina, Chile, etc. devuelve una IP de bloqueo
            y la sesión/token falla con "v8/active: el portal no respondió"). */
         preferDoh: !0,
-        headers: {
-          apk: APP_ID,
-          apkVer: APK_VER_HEADER,
-          spkgVer: SPKG_VER,
-          "User-Agent": USER_AGENT,
-          "Content-Type": CONTENT_TYPE,
-          "Content-Length": Buffer.byteLength(n),
-        },
+        headers: (function () {
+          /* Anti-replay del portal: sin este par el server responde
+             portal200001 ("versión discontinuada") aunque el cifrado sea
+             correcto. */
+          var trace = crypto.randomUUID();
+          return {
+            apk: APP_ID,
+            apkVer: APK_VER_HEADER,
+            spkgVer: SPKG_VER,
+            "X-Request-Trace": trace,
+            "X-Client-Meta": crypto
+              .createHash("md5")
+              .update(trace + "213f24ac-14b7-4c03-a209-383ead1b014f")
+              .digest("hex"),
+            "User-Agent": USER_AGENT,
+            "Content-Type": CONTENT_TYPE,
+            "Content-Length": Buffer.byteLength(n),
+          };
+        })(),
       };
     dnsx.prepare(u, function (t, u) {
       if (!i) {
@@ -521,10 +536,13 @@ function call(e, r, t, n) {
     enqueue(function (s) {
       var a,
         o = {};
-      !1 !== t.baseFields &&
-        ((o.portalCode = PORTAL_CODE),
-        (o.userId = session.userId),
-        (o.userToken = session.userToken));
+      !1 !== t.baseFields
+        ? ((o.portalCode = PORTAL_CODE),
+          (o.userId = session.userId),
+          (o.userToken = session.userToken))
+        : /* snToken/active van con portalCode VACÍO — el real lo manda así y
+             sin el campo el portal responde portal200001. */
+          (o.portalCode = "");
       var i = deviceDict();
       for (a in i) Object.prototype.hasOwnProperty.call(i, a) && (o[a] = i[a]);
       for (a in r) Object.prototype.hasOwnProperty.call(r, a) && (o[a] = r[a]);
@@ -697,10 +715,22 @@ function seedIsUsable(e) {
     !seedIsDead(e)
   );
 }
-function usableSeeds() {
-  for (var e = [], r = 0; r < seedPool.length; r++)
-    seedIsUsable(seedPool[r]) && e.push(seedPool[r]);
-  return e;
+function usableSeeds(includeExpired) {
+  for (var e = [], a = [], r = 0; r < seedPool.length; r++) {
+    var s = seedPool[r];
+    if (s && trim(s.userId) && trim(s.userToken) && !seedIsDead(s)) {
+      a.push(s);
+      if (
+        !("number" == typeof s.exp &&
+          s.exp > 0 &&
+          1e3 * s.exp - Date.now() < SEED_MIN_LIFE_MS)
+      ) {
+        e.push(s);
+      }
+    }
+  }
+  if (e.length) return e;
+  return includeExpired ? a : [];
 }
 function storeSeeds(e) {
   for (var r = Date.now(), t = [], n = [], s = 0; s < e.length; s++) {
@@ -737,71 +767,100 @@ function refreshSeeds(e) {
     if (lastSeedFailure && r - lastSeedFailure < SEED_FAILED_COOLDOWN_MS)
       return e(null, !1);
     seedInflight = !0;
-    var t = url.parse(SEED_URL);
-    ((t.method = "GET"),
-      (t.rejectUnauthorized = !1),
-      (t.headers = { "User-Agent": "XuperTV/webOS" }),
-      dnsx.prepare(t, function (e, r) {
-        if (e) return n(e);
-        var t;
-        r.rejectUnauthorized = !1;
+
+    var n = function (r) {
+      seedInflight = !1;
+      lastSeedFailure = r ? Date.now() : 0;
+      lastSeedError = r ? (r.message || "error") : "";
+      var t = seedWaiters.slice();
+      seedWaiters = [];
+      e(r || null, !r);
+      for (var s = 0; s < t.length; s++)
         try {
-          t = https.request(r, function (e) {
-            if (200 !== e.statusCode)
-              return (
-                e.resume(),
-                n(new Error("semillas HTTP " + e.statusCode))
+          t[s](r || null, !r);
+        } catch (err) {}
+    };
+
+    var fetchSeedList = function (targetUrl, cb) {
+      var fullUrl =
+        targetUrl + (targetUrl.indexOf("?") === -1 ? "?" : "&") + "_t=" + Date.now();
+      var t = url.parse(fullUrl);
+      t.method = "GET";
+      t.rejectUnauthorized = !1;
+      t.headers = { "User-Agent": "XuperTV/webOS" };
+      dnsx.prepare(t, function (err, reqOpts) {
+        if (err) return cb(err);
+        var req;
+        reqOpts.rejectUnauthorized = !1;
+        try {
+          req = https.request(reqOpts, function (res) {
+            if (200 !== res.statusCode) {
+              res.resume();
+              return cb(new Error("semillas HTTP " + res.statusCode));
+            }
+            var chunks = [];
+            res.on("data", function (chunk) {
+              chunks.push(chunk);
+            });
+            res.on("error", function (err) {
+              cb(err);
+            });
+            res.on("end", function () {
+              var parsed;
+              try {
+                parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+              } catch (err) {
+                return cb(err);
+              }
+              var list = parsed && parsed.seeds ? parsed.seeds : parsed;
+              if (!list || !list.length) {
+                return cb(new Error("lista de semillas vacía"));
+              }
+              storeSeeds(list);
+              console.log(
+                "[magis] semillas actualizadas: " +
+                  seedPool.length +
+                  " desde " +
+                  targetUrl
               );
-            var r = [];
-            (e.on("data", function (e) {
-              r.push(e);
-            }),
-              e.on("error", function (e) {
-                n(e);
-              }),
-              e.on("end", function () {
-                var e;
-                try {
-                  e = JSON.parse(Buffer.concat(r).toString("utf8"));
-                } catch (e) {
-                  return n(e);
-                }
-                var t = e && e.seeds ? e.seeds : e;
-                if (!t || !t.length)
-                  return n(new Error("lista de semillas vacía"));
-                (storeSeeds(t),
-                  console.log(
-                    "[magis] semillas actualizadas: " + seedPool.length
-                  ),
-                  n(null));
-              }));
+              cb(null);
+            });
           });
-        } catch (e) {
-          return n(e);
+        } catch (err) {
+          return cb(err);
         }
-        (t.on("error", function (e) {
-          n(e);
-        }),
-          t.setTimeout(6e3, function () {
-            (t.abort(), n(new Error("timeout de semillas")));
-          }),
-          t.end());
-      }));
-  }
-  function n(r) {
-    ((seedInflight = !1),
-      (lastSeedFailure = r ? Date.now() : 0),
-      (lastSeedError = r ? (r.message || "error") : ""));
-    var t = seedWaiters.slice();
-    ((seedWaiters = []), e(r || null, !r));
-    for (var n = 0; n < t.length; n++)
-      try {
-        t[n](r || null, !r);
-      } catch (e) {}
+        req.on("error", function (err) {
+          cb(err);
+        });
+        req.setTimeout(6e3, function () {
+          req.abort();
+          cb(new Error("timeout de semillas"));
+        });
+        req.end();
+      });
+    };
+
+    fetchSeedList(SEED_URL, function (err) {
+      if (!err) return n(null);
+      console.warn(
+        "[magis] SEED_URL fallo (" +
+          (err && err.message ? err.message : err) +
+          "), intentando SEED_BACKUP_URL"
+      );
+      fetchSeedList(SEED_BACKUP_URL, function (bErr) {
+        if (!bErr) return n(null);
+        n(err || bErr);
+      });
+    });
   }
 }
 function pickSeed(e) {
   var r = usableSeeds();
+  if (!r.length) {
+    /* Si todas las semillas expiraron localmente, recurrir como último recurso
+       a las no revocadas mientras se intenta descargar nuevas */
+    r = usableSeeds(!0);
+  }
   if (!r.length) return null;
   for (var t = r.length - 1; t > 0; t--) {
     var n = Math.floor(Math.random() * (t + 1)),
@@ -954,10 +1013,9 @@ function ensureSession(e) {
               snToken: t,
               authVersion: "",
               authCode: "",
-              preCode: "",
               macAddr: FIXED_MAC,
-              reserve1: "",
-              openNum: 4,
+              reserve1: FIXED_RESERVE1,
+              openNum: 3,
               channel: "default",
               matadata: "",
               signdata: "",
@@ -1496,8 +1554,8 @@ function getSlb(e) {
     return e(null, slbCache.slb);
   firstCall(
     [
-      { path: "v14/getSlbInfo", bean: slbBean() },
       { path: "v15/getSlbInfo", bean: slbBean() },
+      { path: "v14/getSlbInfo", bean: slbBean() },
     ],
     function (r, t) {
       return r
@@ -2268,8 +2326,129 @@ function resolveLive(e, r, force) {
     });
   });
 }
+/* --- Ranger (capa nativa) ---------------------------------------------------
+   Arma el triple {env, entries, program} que libranger-jni.so necesita:
+   - env      → Call("SetEnv")     (play_params de getSlbInfo + sesión)
+   - entries  → Call("SetEntries") (cdn_list mapeado al bean Entry de la app)
+   - program  → Call("PrepareProgram") (licencia por episodio de startPlayVOD)
+   La app nativa manda el JSON dentro de "env"/"entries"/"program" como strings
+   (Gson del cliente serializa el bean anidado así). */
+var RANGER_ANDROID_ID_FILE = path.join(__dirname, ".xuper-android-id");
+function rangerAndroidId() {
+  try {
+    var s = trim(fs.readFileSync(RANGER_ANDROID_ID_FILE, "utf8"));
+    if (/^[0-9a-f]{16}$/i.test(s)) return s;
+  } catch (e) {}
+  var id = crypto.randomBytes(8).toString("hex");
+  try {
+    fs.writeFileSync(RANGER_ANDROID_ID_FILE, id);
+  } catch (e) {}
+  return id;
+}
+function rangerEntry(e, total) {
+  var urls = [],
+    list = (e && e.url_list) || [];
+  for (var i = 0; i < list.length; i++) {
+    var u = trim(list[i] && list[i].url);
+    u && urls.push(u);
+  }
+  var qp = function (k) {
+    var m = /[?&]?$/.source;
+    m = new RegExp("[?&]?" + k + "=([^&]*)").exec(urls[0] || "");
+    return m ? m[1] : "";
+  };
+  return {
+    name: trim(e && e.cdn_id_mark),
+    buss: trim(e && e.tag),
+    strategy: trim(e && e.rule_id_mark),
+    main_addr: trim(e && e.main_addr),
+    main_addr_code: trim(e && e.main_addr_mark),
+    spare_addr: trim(e && e.spared_addr),
+    spare_addr_code: trim(e && e.spared_addr_mark),
+    redirect: "1" === trim(e && e.cdn_type) ? "slb" : "",
+    tag: qp("link"),
+    sign_type: qp("sign_type"),
+    priority: Math.max(0, total - (parseInt(e && e.serial_number, 10) || 0)),
+    enable: 1,
+    auths: urls,
+    gslb_params: trim(e && e.gslb_params),
+  };
+}
+function rangerProgram(e, r, t) {
+  /* e = contentId episodio, r = seriesContentId, t = cb(err, {env, entries,
+     program, extra, name, quality, subtitles, audio}). El contenido es volátil:
+     la licencia expira ~24 h y los auths de cdn_list ~4 h — el caller debe
+     generarlo fresco por reproducción, no cachearlo. */
+  ensureSession(function (err, s) {
+    if (err) return t(err);
+    getSlb(function (err, slb) {
+      if (err) return t(err);
+      loadPlay(e, r, function (err, play) {
+        if (err) return t(err);
+        var cdns = (slb && slb.cdn_list) || [],
+          tracks = play.tracks || [],
+          medias = [];
+        for (var i = 0; i < tracks.length; i++) {
+          var tr = tracks[i],
+            lic = trim(
+              (tr.licenseList &&
+                tr.licenseList[0] &&
+                tr.licenseList[0].license) ||
+                ""
+            );
+          lic &&
+            medias.push({
+              format: trim(tr.videoFormat) || "ts",
+              lang: trim(tr.audioInfo),
+              license: lic,
+              name: trim(tr.contentId),
+              quality: trim(tr.quality),
+              vcodec: trim(tr.encodeFormat),
+            });
+        }
+        if (!medias.length)
+          return t(new Error("el portal no devolvió licencias libres"));
+        var first = medias[0];
+        t(null, {
+          env: {
+            android_id: rangerAndroidId(),
+            app: APP_ID,
+            app_ver: APK_VERSION,
+            communication_key: "213f24ac-14b7-4c03-a209-383ead1b014f",
+            dev_id: session.sn,
+            params: trim(slb && slb.play_params),
+            titan_port: 34527,
+            user_id: trim(session.userId),
+          },
+          entries: cdns.map(function (c) {
+            return rangerEntry(c, cdns.length);
+          }),
+          program: {
+            buss: "vod",
+            cause: "user",
+            episode: String(
+              (play.episode && play.episode.episodeNumber) || ""
+            ),
+            from: "masnew_series05",
+            media: first.name,
+            medias: medias,
+            name: trim(e),
+            start: 0,
+            title: text(play.play && play.play.name),
+          },
+          extra: "vod",
+          quality: first.quality,
+          audio: first.lang,
+          subtitles: subtitleList(play.episode),
+          name: text(play.play && play.play.name),
+        });
+      });
+    });
+  });
+}
 module.exports = {
   home: home,
+  xuperProgram: rangerProgram,
   search: search,
   detail: detail,
   mediaInfo: mediaInfo,

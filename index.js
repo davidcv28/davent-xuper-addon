@@ -42,6 +42,10 @@ function readEnvFile(file) {
 }
 const ENV = { ...readEnvFile(ROOT_ENV), ...process.env };
 const TMDB_KEY = ENV.TMDB_API_KEY || '';
+// Deadline duro por pedido /stream: con el portal caído, magis intenta el
+// rescate de semillas una por una (un roundtrip c/u) y el pedido cuelga
+// minutos. Mejor cortar y devolver [] — el server ya tiene su propio timeout.
+const STREAM_DEADLINE_MS = 18e3;
 
 // --- helpers ----------------------------------------------------------------
 const httpGetJson = (u, timeoutMs = 12000) =>
@@ -193,6 +197,35 @@ function toStreams(r, providerTag) {
   return out;
 }
 
+// --- fuente Ranger (app nativa) ----------------------------------------------
+// Emite un stream `xuper://<b64url>` cuyo payload es {env,entries,program} del
+// motor ranger. La APK nativa lo materializa en un proxy local vía
+// libranger-jni.so; la web lo ignora (url no-http no es seleccionable).
+async function rangerStream(contentId, seriesContentId) {
+  try {
+    const p = await cb(magis.xuperProgram, contentId, seriesContentId || '');
+    const payload = Buffer.from(JSON.stringify({ env: p.env, entries: p.entries, program: p.program, extra: p.extra, name: p.program.name }), 'utf8')
+      .toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const langTxt = /spa|es/i.test(p.audio || '') ? 'Latino' : 'Español';
+    return {
+      name: `Xuper TV · ${p.quality || 'SD'}`,
+      title: `${langTxt} · ${p.audio || ''}`.trim(),
+      url: `xuper://${payload}`,
+      // El motor Ranger sirve HLS por su proxy local; el token es opaco y solo
+      // la APK nativa lo materializa (la web lo filtra por scheme).
+      type: 'hls',
+      audioLang: 'es',
+      variant: 'latino',
+      audio: p.audio,
+      subtitles: (p.subtitles || []).map((s) => ({ lang: s.lang, label: s.lang === 'es' ? 'Español' : s.lang === 'en' ? 'English' : s.lang, url: s.url, format: s.format || 'srt' })),
+    };
+  } catch (e) {
+    console.log('[xuper] ranger program falló:', e.message);
+    return null;
+  }
+}
+
 async function resolveTracks(contentId, seriesContentId, opts) {
   const first = await cb(magis.resolve, contentId, seriesContentId, { ...opts, trackIndex: 0 });
   const results = [first];
@@ -217,7 +250,10 @@ async function handleStream(type, rawId) {
 
   if (type === 'movie') {
     try {
-      return { streams: await resolveTracks(item.id, null, opts) };
+      const streams = await resolveTracks(item.id, null, opts);
+      const ranger = await rangerStream(item.id, null);
+      if (ranger) streams.unshift(ranger);
+      return { streams };
     } catch (e) {
       console.log('[xuper] resolve movie falló:', e.message);
       return { streams: [] };
@@ -243,7 +279,10 @@ async function handleStream(type, rawId) {
   const ep = eps.find((x) => Number(x.number) === episode);
   if (!ep) return { streams: [] };
   try {
-    return { streams: await resolveTracks(ep.id, seasonItemId, opts) };
+    const streams = await resolveTracks(ep.id, seasonItemId, opts);
+    const ranger = await rangerStream(ep.id, seasonItemId);
+    if (ranger) streams.unshift(ranger);
+    return { streams };
   } catch (e) {
     console.log('[xuper] resolve ep falló:', e.message);
     return { streams: [] };
@@ -286,9 +325,15 @@ http
       const m = /^\/stream\/(movie|series)\/(.+)\.json$/.exec(pathname);
       if (!m) return send(404, { streams: [] });
       const t0 = Date.now();
-      const out = await handleStream(m[1], decodeURIComponent(m[2]));
+      // Deadline por request: si el portal está caído, magis quema semillas
+      // una por una sin cortar (cada rescate = un roundtrip) y el pedido
+      // cuelga minutos. Mejor responder [] rápido y que el caller falle solo.
+      const out = await Promise.race([
+        handleStream(m[1], decodeURIComponent(m[2])),
+        new Promise((r) => setTimeout(() => r({ streams: [], _deadline: true }), STREAM_DEADLINE_MS)),
+      ]);
       console.log(`[xuper] ${m[1]} ${m[2]} → ${out.streams.length} streams (${Date.now() - t0}ms)`);
-      send(200, out);
+      send(200, { streams: out.streams || [] });
     } catch (e) {
       console.log('[xuper] error:', e.message);
       send(200, { streams: [] });
