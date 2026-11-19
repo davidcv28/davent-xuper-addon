@@ -1,0 +1,8 @@
+{
+  "name": "davent-xuper-addon",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Adaptador Stremio del portal Xuper/Magis TV (vendor/magis.js MIT © cristianco7)",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" }
+}

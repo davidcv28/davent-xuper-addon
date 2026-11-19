@@ -1,0 +1,3 @@
+.xuper-seeds*.json
+.env
+node_modules/
