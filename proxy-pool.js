@@ -18,7 +18,10 @@ const CACHE_FILE = path.join(__dirname, 'vendor', '.xuper-proxy.json');
 const PROBE_HOST = 'cloudflare.com';
 const CONNECT_TIMEOUT_MS = 5000;
 const ACT_TIMEOUT_MS = 15000;
-const REVALIDATE_MS = 20 * 60 * 1000;
+/* Cada 10 min se re-sondea la ruta viva: los proxies públicos mueren sin
+   aviso y detectarlo acá (en vez de en la request del usuario) es lo que
+   hace la restauración automática — ver onRouteLost en index.js. */
+const REVALIDATE_MS = 10 * 60 * 1000;
 const MAX_CANDIDATES = 150;
 
 /* Las mismas fuentes que usa tools/mint-seeds.js del proyecto original. */
@@ -92,16 +95,25 @@ function fetchCandidates(cb) {
   });
 }
 
+/* testConnect puede lanzar sincrónicamente (puerto NaN, host inválido) y un
+   throw dentro del forEach mata el descubrimiento entero: los waiters de
+   ensureRoute quedan colgados para siempre. Blindamos cada candidato. */
+
 function testConnect(proxy, cb) {
   const [h, po] = proxy.split(':');
   const port = parseInt(po, 10);
   if (!h || !port) return cb(false);
   let done = false;
-  const s = net.connect(port, h, () => {
-    s.write(
-      'CONNECT ' + PROBE_HOST + ':443 HTTP/1.1\r\nHost: ' + PROBE_HOST + ':443\r\n\r\n'
-    );
-  });
+  let s;
+  try {
+    s = net.connect(port, h, () => {
+      s.write(
+        'CONNECT ' + PROBE_HOST + ':443 HTTP/1.1\r\nHost: ' + PROBE_HOST + ':443\r\n\r\n'
+      );
+    });
+  } catch (e) {
+    return cb(false);
+  }
   const fin = (ok) => {
     if (done) return;
     done = true;
@@ -112,13 +124,22 @@ function testConnect(proxy, cb) {
   };
   s.setTimeout(CONNECT_TIMEOUT_MS, () => fin(false));
   s.on('error', () => fin(false));
+  /* Un proxy que acepta el TCP y cierra sin responder emite 'end'/'close',
+     no 'error' — sin este handler el socket muere silencioso y el contador
+     de candidatos nunca completa: discovery colgado para siempre. */
+  s.on('end', () => fin(false));
+  s.on('close', () => fin(false));
   s.on('data', (d) => fin(/HTTP\/1\.[01] 200/.test(d.toString())));
 }
 
 /* La prueba de verdad: una llamada pre-auth del portal (geo-gated).
-   snToken no pisa la sesión viva — es seguro sondear aunque ya haya una. */
+   snToken no pisa la sesión viva — es seguro sondear aunque ya haya una.
+   El agente va atado al proxy del probe (no al config global) y corre fuera
+   de la cola serial: así varios probes corren en paralelo y el descubrimiento
+   en frío tarda segundos en vez de minutos. */
 function probePortal(proxy, cb) {
-  upstream.configure('http://' + proxy);
+  const agent = upstream.agentForUrl(true, '', 443, 'http://' + proxy);
+  if (!agent) return cb(false);
   const t = setTimeout(() => cb(false), ACT_TIMEOUT_MS);
   magis.call(
     'v3/snToken',
@@ -126,7 +147,7 @@ function probePortal(proxy, cb) {
       androidId: 'probe' + Math.random().toString(16).slice(2, 12),
       cpuId: 'probe' + Math.random().toString(16).slice(2, 12),
     },
-    { baseFields: false, urgent: true },
+    { baseFields: false, urgent: true, probe: true, agent: agent },
     (e, r) => {
       clearTimeout(t);
       cb(!e && !!(r && r.snToken));
@@ -166,13 +187,29 @@ function scheduleRevalidate() {
   if (revalTimer.unref) revalTimer.unref();
 }
 
-function tryCandidates(list, idx, cb) {
-  if (idx >= list.length) return cb(new Error('sin proxies vivos'));
-  const p = list[idx];
-  probePortal(p, (ok) => {
-    if (ok) return activate(p, cb);
-    tryCandidates(list, idx + 1, cb);
-  });
+/* Sondeo en paralelo: cada probe lleva su propio agente de proxy, así que no
+   se pisan entre sí. El primero que pasa activa la ruta; el resto queda
+   descartado (sus sockets mueren solos al expirar). Serial era inviable en
+   cold-start: 15s por candidato × N vivos = minutos sin ruta. */
+const PARALLEL_PROBES = 30;
+function tryCandidates(list, cb) {
+  const cands = list.slice(0, PARALLEL_PROBES);
+  let pending = cands.length,
+    settled = false;
+  if (!pending) return cb(new Error('sin proxies vivos'));
+  cands.forEach((p) =>
+    probePortal(p, (ok) => {
+      if (settled) return;
+      if (ok) {
+        settled = true;
+        return activate(p, cb);
+      }
+      if (--pending === 0) {
+        settled = true;
+        cb(new Error('sin proxies vivos'));
+      }
+    })
+  );
 }
 
 /* Garantiza una ruta viva. Prioridad: XUPER_PROXY env > cache > descubrir. */
@@ -229,13 +266,15 @@ function ensureRoute(cb) {
   tryCached(discover);
 
   function discover() {
+    console.log('[xuper-proxy] descubriendo candidatos...');
     fetchCandidates((list) => {
+      console.log('[xuper-proxy] ' + list.length + ' candidatos de las listas');
       if (!list.length) return done(new Error('listas de proxies vacías'));
       const candidates = list.slice(0, MAX_CANDIDATES);
       const live = [];
       let tested = 0;
-      candidates.forEach((p) =>
-        testConnect(p, (ok) => {
+      candidates.forEach((p) => {
+        const onTested = (ok) => {
           if (ok) live.push(p);
           if (++tested === candidates.length) {
             console.log(
@@ -246,10 +285,15 @@ function ensureRoute(cb) {
                 ' proxies con túnel CONNECT; probando portal...'
             );
             if (!live.length) return done(new Error('ningún proxy respondió CONNECT'));
-            tryCandidates(live, 0, done);
+            tryCandidates(live, done);
           }
-        })
-      );
+        };
+        try {
+          testConnect(p, onTested);
+        } catch (e) {
+          onTested(false);
+        }
+      });
     });
   }
 }
@@ -261,4 +305,15 @@ function markBad() {
   current = null;
 }
 
-module.exports = { ensureRoute, markBad, current: () => current };
+module.exports = {
+  ensureRoute,
+  markBad,
+  current: () => current,
+  /* Hook de auto-restauración: se dispara cuando la revalidación encuentra
+     la ruta muerta. index.js lo usa para re-descubrir en background, así
+     la próxima request ya encuentra una ruta viva en vez de esperar el
+     descubrimiento completo. */
+  onRouteLost: (fn) => {
+    onRouteLost = fn;
+  },
+};

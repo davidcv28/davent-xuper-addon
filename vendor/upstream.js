@@ -36,16 +36,18 @@ function describe() {
     ? { host: config.host, port: config.port, auth: !!config.auth }
     : null;
 }
-function basicAuth() {
-  return config && config.auth
+function basicAuth(cfg) {
+  cfg = cfg || config;
+  return cfg && cfg.auth
     ? "Proxy-Authorization: Basic " +
         (Buffer.from
-          ? Buffer.from(config.auth, "utf8").toString("base64")
-          : new Buffer(config.auth, "utf8").toString("base64")) +
+          ? Buffer.from(cfg.auth, "utf8").toString("base64")
+          : new Buffer(cfg.auth, "utf8").toString("base64")) +
         "\r\n"
     : "";
 }
-function tunnel(t, n, r) {
+function tunnel(t, n, r, cfg) {
+  cfg = cfg || config;
   var e,
     o = !1;
   function i(t, n, e) {
@@ -58,7 +60,7 @@ function tunnel(t, n, r) {
     i(new Error(m));
   }
   try {
-    e = net.connect(config.port, config.host);
+    e = net.connect(cfg.port, cfg.host);
   } catch (t) {
     return i(t);
   }
@@ -71,8 +73,16 @@ function tunnel(t, n, r) {
   e.on("error", function (t) {
     i(t);
   });
+  /* Si el proxy cierra el socket sin responder (FIN/RST limpio), no llega
+     'error' y el túnel queda colgado — el request nunca se entera. */
+  e.on("end", function () {
+    fail("proxy cerró la conexión");
+  });
+  e.on("close", function () {
+    fail("proxy cerró la conexión");
+  });
 
-  if (config.socks) {
+  if (cfg.socks) {
     /* SOCKS5: greeting (no-auth / user-pass), CONNECT con hostname (ATYP=3 →
        el exit resuelve el DNS remoto, no el nuestro envenenado). */
     var stage = 0,
@@ -90,7 +100,7 @@ function tunnel(t, n, r) {
       stage = 2;
     }
     e.on("connect", function () {
-      e.write(config.auth ? Buffer.from([5, 2, 0, 2]) : Buffer.from([5, 1, 0]));
+      e.write(cfg.auth ? Buffer.from([5, 2, 0, 2]) : Buffer.from([5, 1, 0]));
     });
     e.on("data", function onData(d) {
       sbuf = Buffer.concat([sbuf, d]);
@@ -103,8 +113,8 @@ function tunnel(t, n, r) {
             s5Request();
             continue;
           }
-          if (m === 2 && config.auth) {
-            var a = String(config.auth).split(":"),
+          if (m === 2 && cfg.auth) {
+            var a = String(cfg.auth).split(":"),
               u = Buffer.from(a[0] || "", "utf8"),
               p = Buffer.from(a.slice(1).join(":") || "", "utf8");
             e.write(
@@ -165,7 +175,7 @@ function tunnel(t, n, r) {
       ":" +
       n +
       "\r\n" +
-      basicAuth() +
+      basicAuth(cfg) +
       "\r\n";
     e.write(r);
   });
@@ -187,7 +197,7 @@ function tunnel(t, n, r) {
     }
   });
 }
-function connectionFor(t, n, r, e, o) {
+function connectionFor(t, n, r, e, o, cfg) {
   tunnel(n, r, function (r, i) {
     if (r) return o(r);
     if (!t) return o(null, i);
@@ -208,10 +218,11 @@ function connectionFor(t, n, r, e, o) {
     u.on("error", function (t) {
       o(t);
     });
-  });
+  }, cfg);
 }
-function agentFor(t, n, r) {
-  if (config) {
+function agentFor(t, n, r, cfg) {
+  cfg = cfg || config;
+  if (cfg) {
     var e = new (t ? https.Agent : http.Agent)({
       keepAlive: !1,
       maxSockets: 8,
@@ -221,16 +232,23 @@ function agentFor(t, n, r) {
         var i = (e && (e.host || e.hostname)) || n,
           u = (e && e.port) || r || (t ? 443 : 80),
           c = (e && e.servername) || i;
-        connectionFor(!!t, i, u, c, o);
+        connectionFor(!!t, i, u, c, o, cfg);
       }),
       e
     );
   }
+}
+/* Agente atado a UN proxy (URL), sin tocar el config global: permite sondear
+   varios proxies en paralelo sin que un probe pise la ruta del otro. */
+function agentForUrl(t, n, r, u) {
+  var c = parse(u);
+  return c ? agentFor(t, n, r, c) : null;
 }
 module.exports = {
   configure: configure,
   enabled: enabled,
   describe: describe,
   agentFor: agentFor,
+  agentForUrl: agentForUrl,
   parse: parse,
 };

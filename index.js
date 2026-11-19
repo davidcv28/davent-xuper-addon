@@ -63,6 +63,44 @@ if (ENV.XUPER_PROXY || ENV.HTTPS_PROXY || ENV.https_proxy) {
 // rescate de semillas una por una (un roundtrip c/u) y el pedido cuelga
 // minutos. Mejor cortar y devolver [] — el server ya tiene su propio timeout.
 const STREAM_DEADLINE_MS = 18e3;
+/* Espera REAL a la ruta de proxy: ensureRoute es callback-style (el await
+   pelado no esperaba nada y las requests corrían sin proxy → geo-block).
+   En cold-start el descubrimiento tarda ~10-30s; cap para no colgar el
+   request para siempre — si vence, handleStream igual corre (falla a [] y
+   el retry lo vuelve a intentar con la ruta que ya haya quedado). */
+const ROUTE_WAIT_MS = 45e3;
+const waitRoute = () =>
+  Promise.race([
+    new Promise((res) =>
+      proxyPool.ensureRoute((e) => res(!e))
+    ),
+    new Promise((res) => setTimeout(() => res(false), ROUTE_WAIT_MS)),
+  ]);
+/* Auto-restauración: cuando la revalidación del pool detecta que la ruta
+   murió, arranca el re-descubrimiento AHORA (en background) en vez de
+   esperar a que lo dispare la request de un usuario — para cuando llegue,
+   la ruta nueva ya está viva. */
+proxyPool.onRouteLost(() => {
+  console.log('[xuper] ruta caída → re-descubriendo en background');
+  proxyPool.ensureRoute(() => {});
+});
+/* Render free duerme el servicio tras ~15 min sin requests entrantes: cada
+   cold-start volvía a pagar el descubrimiento de proxies. Un self-ping cada
+   10 min lo mantiene despierto y con la ruta viva (solo si corre en Render,
+   que exporta RENDER_EXTERNAL_URL). */
+const SELF_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+if (SELF_URL && ADDON_TOKEN) {
+  setInterval(() => {
+    const u = SELF_URL + '/' + ADDON_TOKEN + '/manifest.json';
+    const mod = u.startsWith('https') ? require('https') : http;
+    mod
+      .get(u, (res) => res.resume())
+      .on('error', () => {})
+      .setTimeout(8000, function () {
+        this.destroy();
+      });
+  }, 10 * 60e3).unref();
+}
 
 // --- helpers ----------------------------------------------------------------
 const httpGetJson = (u, timeoutMs = 12000) =>
@@ -358,7 +396,7 @@ http
       if (ENV.XUPER_PROXY || ENV.HTTPS_PROXY || ENV.https_proxy) {
         out = await doStream();
       } else {
-        await proxyPool.ensureRoute(() => {});
+        await waitRoute();
         out = await doStream();
         // 0 streams + sesión geo-bloqueada/muerta en masa o deadline con el
         // proxy colgado → la ruta probablemente murió; re-sondear y un retry.
@@ -366,7 +404,7 @@ http
           const st = magis.seedStatus();
           if (!st.pool && st.lastError) {
             proxyPool.markBad();
-            await proxyPool.ensureRoute(() => {});
+            await waitRoute();
             out = await doStream();
           }
         }

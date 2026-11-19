@@ -309,7 +309,7 @@ function hostOrder() {
     HOSTS[r] !== preferredHost && e.push(HOSTS[r]);
   return e;
 }
-function post(e, r, t) {
+function post(e, r, t, x) {
   var n;
   try {
     n = encryptBody(JSON.stringify(r));
@@ -346,7 +346,7 @@ function post(e, r, t) {
         rejectUnauthorized: !1,
         protocol: a ? "http:" : "https:",
         port: a ? 80 : 443,
-        agent: upstream.agentFor(!a, r, a ? 80 : 443),
+        agent: (x && x.agent) || upstream.agentFor(!a, r, a ? 80 : 443),
         path: "/api/portalCore/" + e,
         method: "POST",
         /* El portal SIEMPRE se resuelve por DoH: nunca se usa la respuesta del
@@ -556,7 +556,9 @@ function post(e, r, t) {
 function call(e, r, t, n) {
   ("function" == typeof t && ((n = t), (t = {})),
     (t = t || {}),
-    enqueue(function (s) {
+    /* t.probe (sondeo del proxy-pool): corre SIN la cola serial — varios
+       probes en paralelo, y no bloquea las llamadas reales. */
+    (t.probe ? function (j) { j(function () {}); } : enqueue)(function (s) {
       var a,
         o = {};
       !1 !== t.baseFields
@@ -571,6 +573,9 @@ function call(e, r, t, n) {
       for (a in r) Object.prototype.hasOwnProperty.call(r, a) && (o[a] = r[a]);
       post(e, o, function (a, o) {
         s();
+        /* Probe del proxy-pool: sin reintentos de sesión ni rescate de
+           semillas — un portalCode de acá no dice nada del estado global. */
+        if (t.probe) return n(a, o);
         var i = a && a.portalCode,
           l = i && SESSION_DEAD[i],
           u =
@@ -646,7 +651,7 @@ function call(e, r, t, n) {
           );
         }
         n(a, o);
-      });
+      }, { agent: t.agent });
     }, t.urgent));
 }
 var seedPool = [],
