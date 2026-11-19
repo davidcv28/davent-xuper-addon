@@ -286,6 +286,6 @@ http
       send(200, { streams: [] });
     }
   })
-  // Bind todas las interfaces: en la nube (Render/Koyeb) es obligatorio y
-  // en local el server sigue alcanzándolo por 127.0.0.1 igual.
-  .listen(PORT, () => console.log(`[xuper-addon] :${PORT} listo`));
+  // Bind IPv4 explícito: .listen(PORT) sin host bindea '::' y en Render los
+  // health checks IPv4 no llegan (el request entra y cuelga sin respuesta).
+  .listen(PORT, '0.0.0.0', () => console.log(`[xuper-addon] :${PORT} listo`));
