@@ -1,3 +1,4 @@
 .xuper-seeds*.json
 .env
 node_modules/
+.xuper-private-seeds.json

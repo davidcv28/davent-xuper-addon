@@ -340,6 +340,40 @@ function adoptMint(mint) {
   } catch (e) {}
 }
 
+/* Relleno del stockpile en background: tras activar una ruta, se sondean
+   unos proxies extra SOLO para cosechar sus sesiones minteadas. No toca la
+   ruta ni la sesión activa — cada cuenta extra es una rotación futura que
+   no paga descubrimiento. Topes: stockpile lleno o un pase cada 30 min. */
+const STOCKPILE_TARGET = 8;
+let stockpileAt = 0;
+function stockpileSoon() {
+  if (process.env.XUPER_PROXY) return; // ruta fija: no hace falta granja
+  if (loadPrivateSeeds().filter((s) => !s.dead).length >= STOCKPILE_TARGET) return;
+  if (Date.now() - stockpileAt < 30 * 60e3) return;
+  stockpileAt = Date.now();
+  fetchCandidates((list) => {
+    const fresh = list.filter((p) => p !== current).slice(0, 60);
+    let i = 0,
+      live = 0;
+    const step = () => {
+      while (i < fresh.length && live < PARALLEL_PROBES) {
+        const p = fresh[i++];
+        live++;
+        testConnect(p, (ok) => {
+          live--;
+          if (ok && loadPrivateSeeds().filter((s) => !s.dead).length < STOCKPILE_TARGET) {
+            probePortal(p, (ok2, mint) => {
+              if (ok2 && mint) harvestMint(mint);
+            });
+          }
+          step();
+        });
+      }
+    };
+    step();
+  });
+}
+
 function activate(proxy, cb) {
   current = proxy;
   lastOkAt = Date.now();
@@ -356,6 +390,7 @@ function activate(proxy, cb) {
       JSON.stringify({ proxy, at: Date.now() })
     );
   } catch (e) {}
+  stockpileSoon();
   console.log('[xuper-proxy] ruta activa: ' + proxy);
   scheduleRevalidate();
   cb && cb(null, proxy);
