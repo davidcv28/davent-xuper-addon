@@ -102,6 +102,72 @@ if (SELF_URL && ADDON_TOKEN) {
   }, 10 * 60e3).unref();
 }
 
+// --- watchdog de salud del portal --------------------------------------------
+/* El addon puede quedar "vivo pero vacío": el proceso responde manifest (200)
+   pero la sesión del portal o la ruta de proxy murieron en silencio y TODO
+   /stream devuelve [] — síntoma real observado: Xuper desapareció del menú
+   con el proceso corriendo. Un probe real periódico (search de un título que
+   siempre está en el catálogo) detecta el estado y dispara el mismo reset
+   que haría un reinicio: sesión limpia + re-activación + re-descubrimiento
+   de ruta. Costo: una búsqueda al portal cada XUPER_HEALTH_MS (default 10min). */
+const HEALTH_MS = Number(process.env.XUPER_HEALTH_MS || 10 * 60e3);
+const health = { at: 0, ok: null, fails: 0, heals: 0, lastError: '' };
+let healthBusy = false;
+function healthProbe() {
+  return Promise.race([
+    cb(magis.search, 'matrix')
+      .then((res) => ((res && res.items) || []).length > 0)
+      .catch((e) => {
+        health.lastError = (e && e.message) || 'search falló';
+        return false;
+      }),
+    new Promise((r) => setTimeout(() => r(false), 25e3)),
+  ]);
+}
+async function healthHeal() {
+  health.heals++;
+  // Los tokens cacheados llevan auth de la sesión que se está descartando:
+  // limpiarlos evita servir URLs muertas tras el reset.
+  try { streamCache.clear(); } catch {}
+  try { magis.resetSessionAfterLiveFailure(); } catch {}
+  try {
+    await Promise.race([
+      new Promise((r) => magis.ensureSession(() => r())),
+      new Promise((r) => setTimeout(r, 45e3)),
+    ]);
+  } catch {}
+  // La ruta del pool también pudo morir: markBad fuerza re-descubrimiento.
+  if (!(ENV.XUPER_PROXY || ENV.HTTPS_PROXY || ENV.https_proxy)) {
+    try { proxyPool.markBad(); } catch {}
+    await waitRoute();
+  }
+}
+async function healthTick() {
+  if (healthBusy) return;
+  healthBusy = true;
+  try {
+    health.at = Date.now();
+    let ok = await healthProbe();
+    if (!ok) {
+      health.fails++;
+      console.log(`[xuper] probe de salud FALLÓ (${health.lastError || '0 ítems'}) → reseteando sesión/ruta`);
+      await healthHeal();
+      ok = await healthProbe();
+      console.log(`[xuper] probe post-heal: ${ok ? 'OK' : 'SIGUE MAL — se reintenta en el próximo ciclo'}`);
+    }
+    health.ok = ok;
+    if (ok) health.fails = 0;
+  } catch (e) {
+    console.log('[xuper] watchdog error:', e && e.message);
+  } finally {
+    healthBusy = false;
+  }
+}
+setInterval(healthTick, HEALTH_MS).unref();
+// Primer probe ~90s tras el boot: atrapa una ruta/sesión muerta de nacimiento
+// (el bootstrap restaura sesión cacheada que pudo expirar en el portal).
+setTimeout(healthTick, 90e3).unref();
+
 // --- helpers ----------------------------------------------------------------
 const httpGetJson = (u, timeoutMs = 12000) =>
   new Promise((resolve, reject) => {
@@ -197,7 +263,29 @@ function scoreCandidate(item, want, type) {
   return score;
 }
 
+// Caché título→ítem del portal (~6 h): cada episodio de una misma serie
+// re-pagaba search+detail enteros. El ítem cambia solo si el portal re-sube
+// el contenido, cosa rara dentro de la ventana.
+const PORTAL_ITEM_MS = 6 * 60 * 60e3;
+const portalItemCache = new Map(); // `${type}:${title|year}` -> {v:item, at}
+// Caché de detail por ítem de temporada (~1 h): la lista de episodios cambia
+// lento y detail() cuesta un roundtrip al portal por capítulo pedido.
+const DETAIL_MS = 60 * 60e3;
+const detailCache = new Map(); // itemId -> {v:det, at}
+
+function detailCached(id) {
+  const hit = detailCache.get(id);
+  if (hit && Date.now() - hit.at < DETAIL_MS) return Promise.resolve(hit.v);
+  return cb(magis.detail, id).then((det) => {
+    if (det) detailCache.set(id, { v: det, at: Date.now() });
+    return det;
+  });
+}
+
 async function findPortalItem(want, type) {
+  const ck = `${type}:${norm(want.title)}|${want.year || ''}`;
+  const chit = portalItemCache.get(ck);
+  if (chit && Date.now() - chit.at < PORTAL_ITEM_MS) return chit.v;
   for (const q of [want.title, want.alt].filter(Boolean)) {
     let res;
     try {
@@ -217,7 +305,10 @@ async function findPortalItem(want, type) {
         bestScore = s;
       }
     }
-    if (best) return best;
+    if (best) {
+      portalItemCache.set(ck, { v: best, at: Date.now() });
+      return best;
+    }
   }
   return null;
 }
@@ -286,14 +377,15 @@ async function rangerStream(contentId, seriesContentId) {
 }
 
 async function resolveTracks(contentId, seriesContentId, opts) {
-  const first = await cb(magis.resolve, contentId, seriesContentId, { ...opts, trackIndex: 0 });
-  const results = [first];
+  // Las 3 pistas se resuelven EN PARALELO (antes eran secuenciales: cada
+  // resolve es un startPlayVOD al portal y sumaban varios segundos).
+  const [first, ...rest] = await Promise.all([
+    cb(magis.resolve, contentId, seriesContentId, { ...opts, trackIndex: 0 }),
+    cb(magis.resolve, contentId, seriesContentId, { ...opts, trackIndex: 1 }).catch(() => null),
+    cb(magis.resolve, contentId, seriesContentId, { ...opts, trackIndex: 2 }).catch(() => null),
+  ]);
   const n = Math.min((first.availableTracks || []).length, 3);
-  for (let i = 1; i < n; i++) {
-    try {
-      results.push(await cb(magis.resolve, contentId, seriesContentId, { ...opts, trackIndex: i }));
-    } catch { /* una pista rota no tumba al resto */ }
-  }
+  const results = [first, ...rest.slice(0, Math.max(0, n - 1)).filter(Boolean)];
   return results.flatMap((r, i) => toStreams(r, i > 0 ? `pista${i + 1}` : ''));
 }
 
@@ -315,8 +407,12 @@ async function handleStream(type, rawId) {
 
   if (type === 'movie') {
     try {
-      const streams = await resolveTracks(item.id, null, opts);
-      const ranger = await rangerStream(item.id, null);
+      // tracks y program ranger son independientes (mismo contentId): en
+      // paralelo se ahorra un roundtrip completo al portal por título.
+      const [streams, ranger] = await Promise.all([
+        resolveTracks(item.id, null, opts),
+        rangerStream(item.id, null),
+      ]);
       if (ranger) streams.unshift(ranger);
       return { streams };
     } catch (e) {
@@ -326,7 +422,7 @@ async function handleStream(type, rawId) {
   }
 
   // series: cada temporada es un ítem; episodes[] lleva id propio + number
-  const det = await cb(magis.detail, item.id).catch((e) => {
+  const det = await detailCached(item.id).catch((e) => {
     console.log('[xuper] detail falló:', e && e.message);
     return null;
   });
@@ -340,7 +436,7 @@ async function handleStream(type, rawId) {
     const s = (det.seasons || []).find((x) => Number(x.number) === season);
     if (s) {
       seasonItemId = s.id;
-      const d2 = await cb(magis.detail, s.id).catch(() => null);
+      const d2 = await detailCached(s.id).catch(() => null);
       eps = (d2 && d2.episodes) || [];
     }
   }
@@ -350,8 +446,10 @@ async function handleStream(type, rawId) {
     return { streams: [] };
   }
   try {
-    const streams = await resolveTracks(ep.id, seasonItemId, opts);
-    const ranger = await rangerStream(ep.id, seasonItemId);
+    const [streams, ranger] = await Promise.all([
+      resolveTracks(ep.id, seasonItemId, opts),
+      rangerStream(ep.id, seasonItemId),
+    ]);
     if (ranger) streams.unshift(ranger);
     return { streams };
   } catch (e) {
@@ -361,6 +459,16 @@ async function handleStream(type, rawId) {
 }
 
 // --- server ------------------------------------------------------------------
+// Caché de resoluciones: el server llama al mismo /stream/… varias veces en
+// paralelo (oleada fast+slow + índice) y cada una pagaba la cadena entera al
+// portal (search→detail→resolve×3→ranger program) por la ruta proxy — 15-30 s
+// por request idéntico. Los auths del CDN duran ~4 h y el server ya cachea
+// 2 h en su índice, así que 30 min acá es conservador. Solo se cachean
+// respuestas CON streams (un [] puede ser ruta/sesión muerta, no miss real).
+const STREAM_CACHE_MS = 30 * 60e3;
+const streamCache = new Map(); // 'type:id' -> {v, at}
+const inflight = new Map();    // 'type:id' -> Promise (dedup en vuelo)
+
 const MANIFEST = {
   id: 'community.davent.xuper',
   version: '1.0.0',
@@ -393,9 +501,20 @@ http
       }
       if (pathname === '/manifest.json') return send(200, MANIFEST);
       if (pathname === '/seed-status') return send(200, magis.seedStatus());
+      if (pathname === '/health') return send(200, {
+        ...health,
+        sessionReady: !!magis.session.ready,
+        seeds: magis.seedStatus(),
+      });
       const m = /^\/stream\/(movie|series)\/(.+)\.json$/.exec(pathname);
       if (!m) return send(404, { streams: [] });
       const t0 = Date.now();
+      const cacheKey = `${m[1]}:${decodeURIComponent(m[2])}`;
+      const hit = streamCache.get(cacheKey);
+      if (hit && Date.now() - hit.at < STREAM_CACHE_MS) {
+        console.log(`[xuper] ${cacheKey} → ${hit.v.length} streams (cache ${Math.round((Date.now() - hit.at) / 1000)}s)`);
+        return send(200, { streams: hit.v });
+      }
       // Deadline por request: si el portal está caído, magis quema semillas
       // una por una sin cortar (cada rescate = un roundtrip) y el pedido
       // cuelga minutos. Mejor responder [] rápido y que el caller falle solo.
@@ -408,32 +527,44 @@ http
             setTimeout(() => r({ streams: [], _deadline: true }), STREAM_DEADLINE_MS)
           ),
         ]);
-      let out;
-      if (ENV.XUPER_PROXY || ENV.HTTPS_PROXY || ENV.https_proxy) {
-        out = await doStream();
-      } else {
-        await waitRoute();
-        out = await doStream();
-        // 0 streams por deadline (ruta colgada — la firma típica de proxy
-        // muerto) o con pool de semillas agotado → ruta sospechosa: se marca
-        // mala, se re-descubre y se reintenta UNA vez. Un miss legítimo
-        // (título que no está en el catálogo) responde rápido y no reintenta.
-        if (!out.streams.length) {
-          const st = magis.seedStatus();
-          if (out._deadline || (!st.pool && st.lastError)) {
-            /* Primero rotación barata: si la sesión murió, otra cuenta del
-               stockpile privado se adopta al instante — sin proxy ni
-               descubrimiento. Solo si no hay stockpile se re-descubre ruta. */
-            if (!st.pool && st.lastError) proxyPool.markSessionDead();
-            if (proxyPool.nextPrivateSession()) out = await doStream();
-            if (!out.streams.length) {
-              proxyPool.markBad();
-              await waitRoute();
-              out = await doStream();
+      const resolveOnce = async () => {
+        let out;
+        if (ENV.XUPER_PROXY || ENV.HTTPS_PROXY || ENV.https_proxy) {
+          out = await doStream();
+        } else {
+          await waitRoute();
+          out = await doStream();
+          // 0 streams por deadline (ruta colgada — la firma típica de proxy
+          // muerto) o con pool de semillas agotado → ruta sospechosa: se marca
+          // mala, se re-descubre y se reintenta UNA vez. Un miss legítimo
+          // (título que no está en el catálogo) responde rápido y no reintenta.
+          if (!out.streams.length) {
+            const st = magis.seedStatus();
+            if (out._deadline || (!st.pool && st.lastError)) {
+              /* Primero rotación barata: si la sesión murió, otra cuenta del
+                 stockpile privado se adopta al instante — sin proxy ni
+                 descubrimiento. Solo si no hay stockpile se re-descubre ruta. */
+              if (!st.pool && st.lastError) proxyPool.markSessionDead();
+              if (proxyPool.nextPrivateSession()) out = await doStream();
+              if (!out.streams.length) {
+                proxyPool.markBad();
+                await waitRoute();
+                out = await doStream();
+              }
             }
           }
         }
+        if (out.streams.length) streamCache.set(cacheKey, { v: out.streams, at: Date.now() });
+        return out;
+      };
+      // Dedup en vuelo: N requests concurrentes al mismo id comparten UNA
+      // resolución (la segunda+ espera el resultado en vez de re-pagarla).
+      let p = inflight.get(cacheKey);
+      if (!p) {
+        p = resolveOnce().finally(() => inflight.delete(cacheKey));
+        inflight.set(cacheKey, p);
       }
+      const out = await p;
       console.log(`[xuper] ${m[1]} ${m[2]} → ${out.streams.length} streams (${Date.now() - t0}ms)`);
       send(200, { streams: out.streams || [] });
     } catch (e) {

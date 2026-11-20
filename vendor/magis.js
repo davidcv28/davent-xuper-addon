@@ -998,10 +998,25 @@ function rescueSeed(e, r) {
 })();
 var sessionStarting = !1,
   sessionActTries = 0,
+  sessionStartingAt = 0,
   sessionWaiters = [];
 function ensureSession(e) {
   e = e || function () {};
   var r = Date.now();
+  /* Candado anti-traba: si una activación (v3/snToken→v8/active) muere sin
+     disparar su callback (request colgado que nunca resolvió), sessionStarting
+     quedaba true para SIEMPRE — cada ensureSession posterior solo encolaba
+     waiters y todas las requests colgaban hasta el deadline → el addon
+     devolvía streams:[] permanente y solo revivía reiniciando el proceso.
+     >3 min sin completar = la corrida se perdió: se libera el candado y se
+     arranca una activación nueva (los waiters viejos se sirven cuando ésta
+     termine, quedan en la cola). */
+  if (sessionStarting && sessionStartingAt && r - sessionStartingAt > 180e3) {
+    console.log(
+      "[magis] activación colgada >3min sin completar — destrabando sessionStarting"
+    );
+    sessionStarting = !1;
+  }
   if (session.ready && session.userId && session.userToken) {
     if (!session.at || r - session.at < SESSION_MAX_AGE_MS)
       return e(null, session);
@@ -1011,7 +1026,7 @@ function ensureSession(e) {
       (session.ready = !1));
   }
   if ((sessionWaiters.push(e), !sessionStarting)) {
-    ((sessionStarting = !0), (session.ready = !1));
+    ((sessionStarting = !0), (sessionStartingAt = r), (session.ready = !1));
     var t,
       n = {};
     for (t in FINGERPRINT_FIXED)
@@ -2489,6 +2504,7 @@ module.exports = {
   call: call,
   post: post,
   ensureSession: ensureSession,
+  resetSessionAfterLiveFailure: resetSessionAfterLiveFailure,
   session: session,
   FINGERPRINT_FIXED: FINGERPRINT_FIXED,
   seedStatus: function () {
